@@ -5,6 +5,14 @@
 <p class="lede">上传站点观测 CSV，校验通过后形成待发布候选；确认无误再发布。发布后明细与原始文件作为同一版本对外可见。</p>
 
 <div class="card">
+  <h2>增量交接</h2>
+  <p class="small muted">下游分析库按日期整批替换时使用：按游标翻页，每批下载与发布同版本的标准化明细 CSV。</p>
+  <div class="actions">
+    <a class="btn secondary" href="{{ url_for('admin.handoff_page') }}">进入增量交接</a>
+  </div>
+</div>
+
+<div class="card">
   <h2>上传观测文件</h2>
   <form class="upload" method="post" action="{{ url_for('admin.upload') }}" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

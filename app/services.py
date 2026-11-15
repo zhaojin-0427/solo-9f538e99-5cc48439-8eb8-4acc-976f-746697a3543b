@@ -10,6 +10,7 @@ from typing import Any, Iterable, Sequence
 
 from . import storage
 from .db import transaction
+from .handoff import journal_publish, latest_seq
 from .validation import Observation
 
 PER_PAGE_DEFAULT = 100
@@ -174,6 +175,17 @@ def publish_candidate(
                  WHERE id = ?
                 """,
                 (timestamp, version_id),
+            )
+            # The handoff batch is part of the same transaction: a publish
+            # either becomes visible *and* is journalled exactly once, or
+            # nothing changes at all.
+            journal_publish(
+                conn,
+                version_id=version_id,
+                dataset_date=current["dataset_date"],
+                version_no=current["version_no"],
+                sha256=current["sha256"],
+                published_at=timestamp,
             )
     except Conflict as exc:
         return PublishOutcome(

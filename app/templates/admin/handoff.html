@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+{% block title %}增量交接 · 管理后台{% endblock %}
+{% block content %}
+<h1>增量交接</h1>
+<p class="lede">
+  下游分析库按日期整批替换时使用本页：每次成功发布都会在同一事务登记一个交接批次；失败或重复发布不会新增记录。
+  输入上次完成的游标开始本轮，页面会固定本轮截止批次，按完整批次翻页，并为每批提供标准化明细 CSV 下载。
+</p>
+
+{% if not started %}
+<div class="card">
+  <h2>开始新一轮交接</h2>
+  <p class="small muted">
+    当前已登记 <strong>{{ total_batches }}</strong> 个批次，最新游标为
+    <span class="mono">{{ latest }}</span>。
+    首次交接输入 <span class="mono">0</span>；之后输入上一轮页面给出的“已完成游标”。
+  </p>
+  <form class="filters" method="post" action="{{ url_for('admin.handoff_start') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="cursor">上次完成的游标</label>
+      <input id="cursor" type="text" name="cursor" inputmode="numeric" value="0" required
+             pattern="[0-9]*" autocomplete="off">
+      <span class="hint">只能是不超过最新游标的非负整数</span>
+    </div>
+    <div class="field">
+      <label for="per_page">每页批次数</label>
+      <input id="per_page" type="text" name="per_page" inputmode="numeric"
+             value="{{ default_per_page }}" pattern="[1-9][0-9]*" autocomplete="off">
+      <span class="hint">1 – 100</span>
+    </div>
+    <button class="btn" type="submit">开始本轮</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>交接规则</h2>
+  <ul class="small">
+    <li>开始本轮时即固定截止批次；此后新发布的批次留到下一轮，本轮翻页不会出现。</li>
+    <li>翻页请使用页面返回的续传游标；同一个续传游标重试始终返回同一批次窗口。</li>
+    <li>每批一个版本、一份标准化明细；后续重发同一日期只会形成新批次，旧批内容不变。</li>
+    <li>游标按批次顺序连续推进：接续期间不漏批、不重批，也不混用版本明细。</li>
+  </ul>
+</div>
+{% else %}
+<div class="card">
+  <div class="card-head">
+    <div>
+      <h2>本轮交接</h2>
+      <p class="small muted">
+        起始游标 <span class="mono">{{ page.cursor.round_start }}</span>
+        · 本轮截止批次 <span class="mono">{{ page.cursor.cutoff }}</span>
+        · 每页 {{ page.cursor.per_page }} 批
+      </p>
+    </div>
+    <div class="actions">
+      {% if page.ended %}
+        <span class="badge badge-published">本轮已完成</span>
+      {% else %}
+        <span class="badge badge-candidate">进行中</span>
+      {% endif %}
+    </div>
+  </div>
+  <dl class="meta">
+    <dt>本轮批次总数</dt><dd>{{ page.total_in_round }}</dd>
+    <dt>本页之前已交接</dt><dd>{{ page.done_in_round }} / {{ page.total_in_round }}</dd>
+    <dt>本轮剩余</dt><dd>{{ page.remaining }}</dd>
+    <dt>本轮之外的新发布</dt><dd>{{ new_after_round }} 批（留到下一轮）</dd>
+  </dl>
+</div>
+
+{% if batches %}
+<div class="card">
+  <div class="card-head">
+    <h2>本页批次</h2>
+    <span class="muted small">按游标顺序，共 {{ batches | length }} 批</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th class="num">游标</th>
+          <th>日期</th>
+          <th>版本</th>
+          <th class="num">明细条数</th>
+          <th>发布时间</th>
+          <th>当前状态</th>
+          <th>明细预览</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in batches %}
+        {% set batch = item.batch %}
+        <tr>
+          <td class="num mono">{{ batch.seq }}</td>
+          <td><strong>{{ batch.dataset_date }}</strong></td>
+          <td><span class="badge badge-version">v{{ batch.version_no }}</span></td>
+          <td class="num">{{ batch.row_count }} 条</td>
+          <td class="small muted">{{ batch.published_at | datetime_local }}</td>
+          <td>
+            {% if item.status == 'published' %}
+              <span class="badge badge-published">当前发布</span>
+            {% elif item.status == 'superseded' %}
+              <span class="badge badge-superseded">已被重发替换</span>
+            {% else %}
+              <span class="badge badge-superseded">不可用</span>
+            {% endif %}
+          </td>
+          <td class="small mono">
+            {% if item.preview %}
+              {% for row in item.preview %}{{ row.site }} / {{ row.metric }} / {{ row.observed_at }} / {{ row.value_text }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+              {% if batch.row_count > item.preview | length %}<br><span class="muted">…</span>{% endif %}
+            {% else %}
+              <span class="muted">—</span>
+            {% endif %}
+          </td>
+          <td>
+            <a class="btn small secondary"
+               href="{{ url_for('admin.handoff_batch_download', seq=batch.seq) }}">下载明细 CSV</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="notice small">
+    批次按发布时刻登记并固定到该版本：即使该日期后来重发形成了更新的版本，本批下载的仍是登记时的同一份明细。
+  </div>
+</div>
+{% else %}
+<div class="card empty">
+  <p>本轮没有新批次。可结束本轮并沿用游标
+    <span class="mono">{{ page.cursor.cutoff }}</span>。</p>
+</div>
+{% endif %}
+
+{% if page.ended %}
+<div class="card" id="round-complete">
+  <div class="card-head">
+    <h2>本轮完成</h2>
+    <span class="badge badge-published">已完成游标</span>
+  </div>
+  <p>
+    请把下面的游标记录为已完成游标，下次交接从这里继续。它表示截止批次
+    <span class="mono">{{ completed_cursor }}</span> 为止的批次都已交接。
+  </p>
+  <dl class="meta">
+    <dt>已完成游标</dt>
+    <dd class="mono"><strong>{{ completed_cursor }}</strong></dd>
+    <dt>续传游标（应指明本轮结束）</dt>
+    <dd class="mono small" style="word-break:break-all">{{ token }}</dd>
+  </dl>
+  <div class="actions">
+    <a class="btn" href="{{ url_for('admin.handoff_page', cursor=token) }}">重试本续传游标（结果不变）</a>
+    <form method="post" action="{{ url_for('admin.handoff_start') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="cursor" value="{{ completed_cursor }}">
+      <input type="hidden" name="per_page" value="{{ page.cursor.per_page }}">
+      <button class="btn secondary" type="submit">开始下一轮</button>
+    </form>
+  </div>
+  {% if new_after_round %}
+  <p class="small muted">本轮截止之后已有 {{ new_after_round }} 个新发布批次，开始下一轮即可接续。</p>
+  {% endif %}
+</div>
+{% else %}
+<div class="card">
+  <div class="card-head">
+    <h2>继续翻页</h2>
+    <span class="muted small">本页最后一游标 {{ page.last_cursor }} · 剩余 {{ page.remaining }} 批</span>
+  </div>
+  <p class="small">
+    请使用下面的续传游标继续；重复打开同一个续传游标会返回相同的批次窗口。
+    在翻页期间出现的新发布不会进入本轮。
+  </p>
+  <dl class="meta">
+    <dt>续传游标</dt>
+    <dd class="mono small" style="word-break:break-all">{{ next_token }}</dd>
+  </dl>
+  <div class="actions">
+    <a class="btn" href="{{ url_for('admin.handoff_page', cursor=next_token) }}">下一页</a>
+    <a class="btn secondary" href="{{ url_for('admin.handoff_page') }}">结束并返回</a>
+  </div>
+</div>
+{% endif %}
+
+<div class="actions">
+  <a class="btn secondary" href="{{ url_for('admin.dashboard') }}">返回后台</a>
+</div>
+{% endif %}
+{% endblock %}

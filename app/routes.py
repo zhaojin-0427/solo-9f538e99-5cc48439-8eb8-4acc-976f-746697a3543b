@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
 import secrets
 import sqlite3
 from datetime import date
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from flask import (
     Blueprint,
+    Response,
     abort,
     current_app,
     flash,
@@ -22,6 +24,7 @@ from flask import (
 )
 
 from . import services, storage
+from . import handoff
 from .db import get_db
 from .validation import validate_file
 
@@ -304,3 +307,187 @@ def admin_download(version_id: int):
         download_name=version["original_filename"],
         conditional=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Incremental handoff
+# ---------------------------------------------------------------------------
+
+
+def _handoff_secret() -> str:
+    return current_app.config["SECRET_KEY"]
+
+
+def _batch_views(
+    conn: sqlite3.Connection, batches: list[sqlite3.Row]
+) -> list[dict]:
+    """Attach the owning version's current state plus a short preview."""
+    views = []
+    for batch in batches:
+        version = services.get_version(conn, batch["version_id"])
+        preview = conn.execute(
+            """
+            SELECT site, metric, observed_at, value_text
+              FROM observations
+             WHERE version_id = ?
+             ORDER BY site, metric, observed_at, row_no
+             LIMIT 5
+            """,
+            (batch["version_id"],),
+        ).fetchall()
+        views.append(
+            {
+                "batch": batch,
+                "version": version,
+                "status": version["status"] if version else "missing",
+                "preview": preview,
+            }
+        )
+    return views
+
+
+@admin_bp.get("/handoff")
+def handoff_page():
+    conn = get_db()
+    latest = handoff.latest_seq(conn)
+    total_batches = handoff.count_batches(conn)
+    token = request.args.get("cursor", "").strip()
+
+    if not token:
+        return render_template(
+            "admin/handoff.html",
+            started=False,
+            latest=latest,
+            total_batches=total_batches,
+            default_per_page=handoff.clamp_per_page(
+                current_app.config.get("HANDOFF_PER_PAGE")
+            ),
+        )
+
+    cursor = handoff.decode_cursor(token, secret=_handoff_secret())
+    if cursor is None:
+        flash("续传游标无效或已被改动，请重新输入上次完成的游标开始本轮。", "error")
+        return redirect(url_for("admin.handoff_page"))
+    if cursor.cutoff > latest:
+        # The database no longer contains batches this cursor claims to have
+        # covered (e.g. restored from an older backup).  Continuing would
+        # silently declare unsent batches as handed over.
+        flash(
+            f"续传游标指向批次 {cursor.cutoff}，但当前数据库只有 {latest} 个批次，"
+            "请核对数据存储后重新开始本轮。",
+            "error",
+        )
+        return redirect(url_for("admin.handoff_page"))
+    if cursor.round_start and (
+        handoff.get_batch(conn, cursor.round_start) is None
+    ):
+        flash(
+            "续传游标的起始批次已不在当前数据库中，请重新开始本轮。",
+            "error",
+        )
+        return redirect(url_for("admin.handoff_page"))
+
+    page = handoff.fetch_page(conn, cursor, secret=_handoff_secret())
+    return render_template(
+        "admin/handoff.html",
+        started=True,
+        page=page,
+        token=token,
+        batches=_batch_views(conn, page.batches),
+        latest=latest,
+        total_batches=total_batches,
+        next_token=page.next_cursor,
+        completed_cursor=page.completed_cursor,
+        new_after_round=handoff.count_after(conn, cursor.cutoff),
+        default_per_page=handoff.clamp_per_page(
+            current_app.config.get("HANDOFF_PER_PAGE")
+        ),
+    )
+
+
+@admin_bp.post("/handoff")
+def handoff_start():
+    _check_csrf()
+    conn = get_db()
+    latest = handoff.latest_seq(conn)
+
+    raw_cursor = (request.form.get("cursor") or "").strip()
+    try:
+        after = int(raw_cursor)
+    except ValueError:
+        after = -1
+    if after < 0:
+        flash("请输入上次完成的游标（非负整数）；首次交接请输入 0。", "error")
+        return redirect(url_for("admin.handoff_page"))
+    if after > latest:
+        flash(
+            f"游标 {after} 超过当前最新批次 {latest}，请核对上次完成的游标。",
+            "error",
+        )
+        return redirect(url_for("admin.handoff_page"))
+    if after and handoff.get_batch(conn, after) is None:
+        # Accepting a cursor that is not an actual batch could silently skip
+        # batches in between, so ask the operator to use the cursor printed
+        # at the end of the previous round.
+        flash(
+            f"游标 {after} 不是已登记的批次，请使用上一轮页面给出的已完成游标。",
+            "error",
+        )
+        return redirect(url_for("admin.handoff_page"))
+
+    per_page = handoff.clamp_per_page(
+        request.form.get("per_page") or current_app.config.get("HANDOFF_PER_PAGE")
+    )
+    # The cutoff is fixed once, here.  Anything published while this round is
+    # paged carries a larger seq and is therefore left for the next round.
+    cursor = handoff.HandoffCursor(
+        after=after, cutoff=latest, per_page=per_page, round_start=after
+    )
+    token = handoff.encode_cursor(cursor, secret=_handoff_secret())
+    return redirect(url_for("admin.handoff_page", cursor=token))
+
+
+@admin_bp.get("/handoff/batches/<int:seq>/download")
+def handoff_batch_download(seq: int):
+    """Download one batch's normalized detail, pinned to its version.
+
+    The batch's observation set is re-rendered from the version bound at
+    publish time and checked against the digest recorded then.  A mismatch
+    means the stored data changed after handoff, so the download is refused
+    instead of silently handing over different content.
+    """
+    conn = get_db()
+    batch = handoff.get_batch(conn, seq)
+    if batch is None:
+        abort(404)
+
+    content = handoff.detail_csv_bytes(
+        conn,
+        version_id=batch["version_id"],
+        dataset_date=batch["dataset_date"],
+    )
+    digest = hashlib.sha256(content).hexdigest()
+    if not hmac.compare_digest(digest, batch["detail_sha256"]):
+        current_app.logger.error(
+            "handoff batch %s detail digest mismatch (version %s)",
+            seq,
+            batch["version_id"],
+        )
+        abort(
+            503,
+            description="该批次明细与交接时记录不一致，已拒绝下载；请检查数据存储。",
+        )
+
+    filename = (
+        f"water_quality_{batch['dataset_date']}"
+        f"_v{batch['version_no']}_batch{seq}.csv"
+    )
+    response = Response(content, mimetype="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="{filename}"'
+    )
+    response.headers["X-Handoff-Seq"] = str(seq)
+    response.headers["X-Handoff-Version-Id"] = str(batch["version_id"])
+    response.headers["X-Handoff-Detail-Sha256"] = digest
+    response.headers["Cache-Control"] = "no-store"
+    return response

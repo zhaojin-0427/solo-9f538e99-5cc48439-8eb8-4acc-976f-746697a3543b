@@ -121,3 +121,55 @@ def test_duplicate_upload_is_idempotent_on_disk(app):
         assert stored.read_bytes() == csv_bytes(ROWS)
     finally:
         conn.close()
+
+
+def test_concurrent_publish_same_version_journals_once(app):
+    application = app
+    client = application.test_client()
+    response = client.post(
+        "/admin/upload",
+        data={
+            "dataset_date": "2026-11-14",
+            "file": (io.BytesIO(csv_bytes(ROWS)), "obs.csv"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 302
+
+    conn = connect(application.config["DATABASE"])
+    version_id = conn.execute("SELECT id FROM versions").fetchone()["id"]
+    conn.close()
+
+    barrier = threading.Barrier(4)
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def publish():
+        conn = connect(application.config["DATABASE"])
+        try:
+            barrier.wait()
+            outcome = services.publish_candidate(
+                conn, application.config["FILES_DIR"], version_id
+            )
+            with lock:
+                outcomes.append(outcome.status)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=publish) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcomes.count("published") == 1
+    assert set(outcomes) <= {"published", "already_published"}
+
+    conn = connect(application.config["DATABASE"])
+    try:
+        batches = conn.execute(
+            "SELECT * FROM publication_journal WHERE version_id = ?", (version_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(batches) == 1

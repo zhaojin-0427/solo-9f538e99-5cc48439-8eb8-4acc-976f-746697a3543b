@@ -45,6 +45,42 @@ CREATE TABLE IF NOT EXISTS observations (
 
 CREATE INDEX IF NOT EXISTS idx_observations_version
     ON observations (version_id);
+
+-- Append-only handoff journal.  One row is written in the same transaction
+-- that turns a candidate into the published version for its date, so a
+-- rejected or repeated publish can never add a batch.  ``seq`` is the
+-- downstream handoff cursor: batches are always read with ``seq > cursor``
+-- and a fixed upper bound, never with offsets.
+CREATE TABLE IF NOT EXISTS publication_journal (
+    seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id     INTEGER NOT NULL UNIQUE REFERENCES versions(id),
+    dataset_date   TEXT    NOT NULL,
+    version_no     INTEGER NOT NULL,
+    row_count      INTEGER NOT NULL,
+    sha256         TEXT    NOT NULL,
+    detail_sha256  TEXT    NOT NULL,
+    published_at   TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_publication_journal_date
+    ON publication_journal (dataset_date, seq);
+"""
+
+# The handoff journal is append-only.  These triggers make an accidental
+# rewrite of an already handed-over batch impossible, so a later re-publish
+# can only ever *append* a new batch and never alter an old one.
+JOURNAL_TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS publication_journal_no_update
+BEFORE UPDATE ON publication_journal
+BEGIN
+    SELECT RAISE(ABORT, 'publication_journal is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS publication_journal_no_delete
+BEFORE DELETE ON publication_journal
+BEGIN
+    SELECT RAISE(ABORT, 'publication_journal is append-only');
+END;
 """
 
 
@@ -71,6 +107,7 @@ def init_db(database: str | Path) -> None:
         conn = connect(database)
         try:
             conn.executescript(SCHEMA)
+            conn.executescript(JOURNAL_TRIGGERS)
             return
         except sqlite3.OperationalError as exc:
             # Multiple gunicorn workers may initialise at the same moment.

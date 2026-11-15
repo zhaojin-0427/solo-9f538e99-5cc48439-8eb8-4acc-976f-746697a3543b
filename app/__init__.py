@@ -21,6 +21,7 @@ def create_app(config: dict | None = None) -> Flask:
         FILES_DIR=os.environ.get("FILES_DIR", str(data_dir / "files")),
         MAX_CONTENT_LENGTH=int(os.environ.get("MAX_UPLOAD_BYTES", 64 * 1024 * 1024)),
         PER_PAGE=100,
+        HANDOFF_PER_PAGE=int(os.environ.get("HANDOFF_PER_PAGE", 10)),
         SECRET_KEY=os.environ.get("SECRET_KEY", "dev-only-water-quality-console"),
         ADMIN_DATASET_DATE=os.environ.get("ADMIN_DATASET_DATE", ""),
     )

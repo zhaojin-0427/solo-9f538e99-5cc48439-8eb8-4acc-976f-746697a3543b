@@ -9,6 +9,7 @@ services:
       FILES_DIR: /data/files
       SECRET_KEY: ${SECRET_KEY:-change-me-for-production}
       MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-67108864}
+      HANDOFF_PER_PAGE: ${HANDOFF_PER_PAGE:-10}
     volumes:
       - water-data:/data
     healthcheck:
